@@ -16,23 +16,23 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
-      
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.19.0'
           channel: 'stable'
-      
+
       - name: Setup Android SDK
         run: |
           sudo apt-get update
@@ -40,50 +40,63 @@ jobs:
           wget https://dl.google.com/android/repository/commandlinetools-linux-latest.zip
           unzip commandlinetools-linux-latest.zip -d $HOME/android-sdk
           echo "y" | $HOME/android-sdk/cmdline-tools/bin/sdkmanager --sdk_root=$HOME/android-sdk "platforms;android-33" "build-tools;33.0.0"
-      
+
       - name: Download project ZIP
         run: |
           mkdir -p ${{ github.workspace }}/project
           cd ${{ github.workspace }}/project
           wget -O project.zip "${{ github.event.inputs.project_url }}"
           unzip project.zip
-          
-      - name: Detect project type
+
+      - name: Detect project root & type
         id: detect
         run: |
           cd ${{ github.workspace }}/project
-          if [ -f "pubspec.yaml" ]; then
+
+          PUBSPEC=$(find . -maxdepth 2 -name "pubspec.yaml" | head -1)
+          GRADLE=$(find . -maxdepth 2 -name "build.gradle" | head -1)
+
+          if [ -n "$PUBSPEC" ]; then
+            PROJECT_ROOT=$(dirname "$PUBSPEC")
             echo "type=flutter" >> $GITHUB_OUTPUT
-          elif [ -f "build.gradle" ]; then
+            echo "root=$PROJECT_ROOT" >> $GITHUB_OUTPUT
+          elif [ -n "$GRADLE" ]; then
+            PROJECT_ROOT=$(dirname "$GRADLE")
             echo "type=android" >> $GITHUB_OUTPUT
+            echo "root=$PROJECT_ROOT" >> $GITHUB_OUTPUT
           else
             echo "type=webview" >> $GITHUB_OUTPUT
+            echo "root=." >> $GITHUB_OUTPUT
           fi
-      
+
       - name: Build Flutter APK
         if: steps.detect.outputs.type == 'flutter'
         run: |
-          cd ${{ github.workspace }}/project
+          cd ${{ github.workspace }}/project/${{ steps.detect.outputs.root }}
           flutter pub get
           flutter build apk --release
           mkdir -p ${{ github.workspace }}/output
           cp build/app/outputs/flutter-apk/app-release.apk ${{ github.workspace }}/output/${{ github.event.inputs.app_name }}.apk
-      
+
       - name: Build Android Studio APK
         if: steps.detect.outputs.type == 'android'
         run: |
-          cd ${{ github.workspace }}/project
+          cd ${{ github.workspace }}/project/${{ steps.detect.outputs.root }}
           chmod +x gradlew
           ./gradlew assembleRelease
           mkdir -p ${{ github.workspace }}/output
           find . -name "*.apk" -exec cp {} ${{ github.workspace }}/output/${{ github.event.inputs.app_name }}.apk \;
-      
+
       - name: Build WebView APK (default)
         if: steps.detect.outputs.type == 'webview'
+        env:
+          APP_URL: ${{ github.event.inputs.project_url }}
+          APP_NAME: ${{ github.event.inputs.app_name }}
         run: |
-          mkdir -p ${{ github.workspace }}/webview_project
+          mkdir -p ${{ github.workspace }}/webview_project/lib
           cd ${{ github.workspace }}/webview_project
-          cat > pubspec.yaml << 'EOF'
+
+          cat > pubspec.yaml << EOF
           name: webview_app
           version: 1.0.0
           environment:
@@ -95,42 +108,54 @@ jobs:
           flutter:
             uses-material-design: true
           EOF
-          
-          mkdir -p lib
-          cat > lib/main.dart << 'EOF'
+
+          cat > lib/main.dart << EOF
           import 'package:flutter/material.dart';
           import 'package:webview_flutter/webview_flutter.dart';
-          
-          void main() => runApp(WebApp());
-          
-          class WebApp extends StatelessWidget {
-            final String url = '${{ github.event.inputs.project_url }}';
-            
+
+          void main() => runApp(const WebApp());
+
+          class WebApp extends StatefulWidget {
+            const WebApp({super.key});
+            @override
+            State<WebApp> createState() => _WebAppState();
+          }
+
+          class _WebAppState extends State<WebApp> {
+            late final WebViewController _controller;
+
+            @override
+            void initState() {
+              super.initState();
+              _controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..loadRequest(Uri.parse('\${APP_URL}'));
+            }
+
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: '${{ github.event.inputs.app_name }}',
+                title: '\${APP_NAME}',
                 home: Scaffold(
-                  appBar: AppBar(title: Text('${{ github.event.inputs.app_name }}')),body: WebView(
-                    initialUrl: url,
-                    javascriptMode: JavascriptMode.unrestricted,
-                  ),
+                  appBar: AppBar(title: const Text('\${APP_NAME}')),
+                  body: WebViewWidget(controller: _controller),
                 ),
               );
             }
           }
           EOF
-          
+
           flutter pub get
           flutter build apk --release
+          mkdir -p ${{ github.workspace }}/output
           cp build/app/outputs/flutter-apk/app-release.apk ${{ github.workspace }}/output/${{ github.event.inputs.app_name }}.apk
-      
+
       - name: Upload APK as artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.app_name }}-${{ github.event.inputs.build_id }}
           path: ${{ github.workspace }}/output/*.apk
-      
+
       - name: Upload to Telegram
         run: |
           curl -F "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
