@@ -1,27 +1,29 @@
-name: Build APK from Flutter/ZIP
+name: Build APK
 
 on:
   workflow_dispatch:
     inputs:
-      project_url:
-        description: 'URL ZIP project atau file ZIP'
+      build_type:
+        description: 'flutter or android'
         required: true
-      app_name:
-        description: 'Nama Aplikasi'
+        default: 'flutter'
+      user_id:
+        description: 'Telegram user ID'
         required: true
-      build_id:
-        description: 'ID Build (unique)'
+      chat_id:
+        description: 'Telegram chat ID'
         required: true
 
 jobs:
-  build:
+  build-flutter:
+    if: ${{ github.event.inputs.build_type == 'flutter' }}
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -30,135 +32,133 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.19.0'
+          flutter-version: '3.22.2'
           channel: 'stable'
+          cache: true
 
-      - name: Setup Android SDK
+      - name: Extract project ZIP
         run: |
-          sudo apt-get update
-          sudo apt-get install -y wget unzip
-          wget https://dl.google.com/android/repository/commandlinetools-linux-latest.zip
-          unzip commandlinetools-linux-latest.zip -d $HOME/android-sdk
-          echo "y" | $HOME/android-sdk/cmdline-tools/bin/sdkmanager --sdk_root=$HOME/android-sdk "platforms;android-33" "build-tools;33.0.0"
-
-      - name: Download project ZIP
-        run: |
-          mkdir -p ${{ github.workspace }}/project
-          cd ${{ github.workspace }}/project
-          wget -O project.zip "${{ github.event.inputs.project_url }}"
-          unzip project.zip
-
-      - name: Detect project root & type
-        id: detect
-        run: |
-          cd ${{ github.workspace }}/project
-
-          PUBSPEC=$(find . -maxdepth 2 -name "pubspec.yaml" | head -1)
-          GRADLE=$(find . -maxdepth 2 -name "build.gradle" | head -1)
-
-          if [ -n "$PUBSPEC" ]; then
-            PROJECT_ROOT=$(dirname "$PUBSPEC")
-            echo "type=flutter" >> $GITHUB_OUTPUT
-            echo "root=$PROJECT_ROOT" >> $GITHUB_OUTPUT
-          elif [ -n "$GRADLE" ]; then
-            PROJECT_ROOT=$(dirname "$GRADLE")
-            echo "type=android" >> $GITHUB_OUTPUT
-            echo "root=$PROJECT_ROOT" >> $GITHUB_OUTPUT
-          else
-            echo "type=webview" >> $GITHUB_OUTPUT
-            echo "root=." >> $GITHUB_OUTPUT
+          mkdir -p project
+          ZIP_FILE=$(find uploads/ -name "*.zip" | head -1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: Tidak ada file ZIP di folder uploads/"
+            exit 1
           fi
+          echo "Mengekstrak: $ZIP_FILE"
+          unzip -o "$ZIP_FILE" -d project/
+          ENTRIES=$(ls project/ | wc -l)
+          if [ "$ENTRIES" -eq 1 ]; then
+            SUBDIR=$(ls project/)
+            if [ -d "project/$SUBDIR" ]; then
+              mv project/$SUBDIR/* project/ 2>/dev/null || true
+              mv project/$SUBDIR/.* project/ 2>/dev/null || true
+              rmdir project/$SUBDIR 2>/dev/null || true
+            fi
+          fi
+          ls -la project/
 
-      - name: Build Flutter APK
-        if: steps.detect.outputs.type == 'flutter'
+      - name: Validate Flutter project
         run: |
-          cd ${{ github.workspace }}/project/${{ steps.detect.outputs.root }}
-          flutter pub get
-          flutter build apk --release
-          mkdir -p ${{ github.workspace }}/output
-          cp build/app/outputs/flutter-apk/app-release.apk ${{ github.workspace }}/output/${{ github.event.inputs.app_name }}.apk
+          if [ ! -f "project/pubspec.yaml" ]; then
+            echo "ERROR: pubspec.yaml tidak ditemukan!"
+            exit 1
+          fi
+          echo "OK: pubspec.yaml ditemukan"
 
-      - name: Build Android Studio APK
-        if: steps.detect.outputs.type == 'android'
+      - name: Flutter pub get
+        working-directory: project
+        run: flutter pub get
+
+      - name: Build Flutter APK Release
+        working-directory: project
+        run: flutter build apk --release --no-pub
+
+      - name: Find and copy APK
         run: |
-          cd ${{ github.workspace }}/project/${{ steps.detect.outputs.root }}
-          chmod +x gradlew
-          ./gradlew assembleRelease
-          mkdir -p ${{ github.workspace }}/output
-          find . -name "*.apk" -exec cp {} ${{ github.workspace }}/output/${{ github.event.inputs.app_name }}.apk \;
+          APK=$(find project/build -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK tidak ditemukan setelah build"
+            exit 1
+          fi
+          echo "APK ditemukan: $APK"
+          mkdir -p apk-out
+          cp "$APK" apk-out/
 
-      - name: Build WebView APK (default)
-        if: steps.detect.outputs.type == 'webview'
-        env:
-          APP_URL: ${{ github.event.inputs.project_url }}
-          APP_NAME: ${{ github.event.inputs.app_name }}
-        run: |
-          mkdir -p ${{ github.workspace }}/webview_project/lib
-          cd ${{ github.workspace }}/webview_project
-
-          cat > pubspec.yaml << EOF
-          name: webview_app
-          version: 1.0.0
-          environment:
-            sdk: '>=3.0.0 <4.0.0'
-          dependencies:
-            flutter:
-              sdk: flutter
-            webview_flutter: ^4.4.0
-          flutter:
-            uses-material-design: true
-          EOF
-
-          cat > lib/main.dart << EOF
-          import 'package:flutter/material.dart';
-          import 'package:webview_flutter/webview_flutter.dart';
-
-          void main() => runApp(const WebApp());
-
-          class WebApp extends StatefulWidget {
-            const WebApp({super.key});
-            @override
-            State<WebApp> createState() => _WebAppState();
-          }
-
-          class _WebAppState extends State<WebApp> {
-            late final WebViewController _controller;
-
-            @override
-            void initState() {
-              super.initState();
-              _controller = WebViewController()
-                ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                ..loadRequest(Uri.parse('\${APP_URL}'));
-            }
-
-            @override
-            Widget build(BuildContext context) {
-              return MaterialApp(
-                title: '\${APP_NAME}',
-                home: Scaffold(
-                  appBar: AppBar(title: const Text('\${APP_NAME}')),
-                  body: WebViewWidget(controller: _controller),
-                ),
-              );
-            }
-          }
-          EOF
-
-          flutter pub get
-          flutter build apk --release
-          mkdir -p ${{ github.workspace }}/output
-          cp build/app/outputs/flutter-apk/app-release.apk ${{ github.workspace }}/output/${{ github.event.inputs.app_name }}.apk
-
-      - name: Upload APK as artifact
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.app_name }}-${{ github.event.inputs.build_id }}
-          path: ${{ github.workspace }}/output/*.apk
+          name: apk-output
+          path: apk-out/*.apk
+          retention-days: 1
 
-      - name: Upload to Telegram
+  build-android:
+    if: ${{ github.event.inputs.build_type == 'android' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Extract project ZIP
         run: |
-          curl -F "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
-               -F "document=@${{ github.workspace }}/output/${{ github.event.inputs.app_name }}.apk" \
-               -F "caption=✅ Build Selesai!%0A📱 Nama: ${{ github.event.inputs.app_name }}%0A🆔 ID: ${{ github.event.inputs.build_id }}" \
-               "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/sendDocument"
+          mkdir -p project
+          ZIP_FILE=$(find uploads/ -name "*.zip" | head -1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: Tidak ada ZIP di uploads/"
+            exit 1
+          fi
+          unzip -o "$ZIP_FILE" -d project/
+          ENTRIES=$(ls project/ | wc -l)
+          if [ "$ENTRIES" -eq 1 ]; then
+            SUBDIR=$(ls project/)
+            if [ -d "project/$SUBDIR" ]; then
+              mv project/$SUBDIR/* project/ 2>/dev/null || true
+              rmdir project/$SUBDIR 2>/dev/null || true
+            fi
+          fi
+          ls -la project/
+
+      - name: Validate Android project
+        run: |
+          if [ ! -f "project/build.gradle" ] && [ ! -f "project/build.gradle.kts" ]; then
+            echo "ERROR: build.gradle tidak ditemukan!"
+            exit 1
+          fi
+          echo "OK: build.gradle ditemukan"
+
+      - name: Make gradlew executable
+        working-directory: project
+        run: chmod +x gradlew
+
+      - name: Build Android APK Release
+        working-directory: project
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Find and copy APK
+        run: |
+          APK=$(find project/app/build/outputs/apk -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find project/build -name "*.apk" | head -1)
+          fi
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK tidak ditemukan"
+            exit 1
+          fi
+          mkdir -p apk-out
+          cp "$APK" apk-out/
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-output
+          path: apk-out/*.apk
+          retention-days: 1
